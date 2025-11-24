@@ -11,13 +11,18 @@
 
 namespace Symfony\Component\Notifier\Bridge\MicrosoftTeams;
 
+use JsonException;
 use Symfony\Component\Notifier\Exception\TransportException;
 use Symfony\Component\Notifier\Exception\UnsupportedMessageTypeException;
 use Symfony\Component\Notifier\Message\ChatMessage;
 use Symfony\Component\Notifier\Message\MessageInterface;
+use Symfony\Component\Notifier\Message\MessageOptionsInterface;
 use Symfony\Component\Notifier\Message\SentMessage;
 use Symfony\Component\Notifier\Transport\AbstractTransport;
 use Symfony\Contracts\EventDispatcher\EventDispatcherInterface;
+use Symfony\Contracts\HttpClient\Exception\ClientExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\RedirectionExceptionInterface;
+use Symfony\Contracts\HttpClient\Exception\ServerExceptionInterface;
 use Symfony\Contracts\HttpClient\Exception\TransportExceptionInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
@@ -27,10 +32,11 @@ use Symfony\Contracts\HttpClient\HttpClientInterface;
  */
 final class MicrosoftTeamsTransport extends AbstractTransport
 {
-    protected const ENDPOINT = 'outlook.office.com';
+    private const DSN_PREFIX = 'microsoftteams';
 
     public function __construct(
         private string $path,
+        private array  $options = [],
         ?HttpClientInterface $client = null,
         ?EventDispatcherInterface $dispatcher = null,
     ) {
@@ -39,16 +45,23 @@ final class MicrosoftTeamsTransport extends AbstractTransport
 
     public function __toString(): string
     {
-        return \sprintf('microsoftteams://%s%s', $this->getEndpoint(), $this->path);
+        return sprintf('%s://%s%s%s', self::DSN_PREFIX, $this->getEndpoint(), $this->path, $this->createQueryString());
     }
 
     public function supports(MessageInterface $message): bool
     {
-        return $message instanceof ChatMessage && (null === $message->getOptions() || $message->getOptions() instanceof MicrosoftTeamsOptions);
+        return $message instanceof ChatMessage
+            && (null === $message->getOptions()
+                || $message->getOptions() instanceof MicrosoftTeamsOptions
+                || $message->getOptions() instanceof MicrosoftTeamsWebhookOptions);
     }
 
     /**
-     * @see https://docs.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/connectors-using#post-a-message-to-the-webhook-using-curl
+     * @throws ClientExceptionInterface
+     * @throws JsonException
+     * @throws RedirectionExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws TransportExceptionInterface
      */
     protected function doSend(MessageInterface $message): SentMessage
     {
@@ -56,14 +69,40 @@ final class MicrosoftTeamsTransport extends AbstractTransport
             throw new UnsupportedMessageTypeException(__CLASS__, ChatMessage::class, $message);
         }
 
-        $options = $message->getOptions()?->toArray() ?? [];
-        $options['text'] ??= $message->getSubject();
+        $options = $message->getOptions();
+
+        if ($options instanceof MicrosoftTeamsOptions) {
+            return $this->sendLegacyMessage($message, $options);
+        }
+
+        return $this->sendMessage($message, $options);
+    }
+
+    private function createQueryString(): string
+    {
+        if (empty($this->options)) {
+            return '';
+        }
+
+        return '?' . http_build_query($this->options);
+    }
+
+    /**
+     * @see https://docs.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/connectors-using#post-a-message-to-the-webhook-using-curl
+     *
+     * @throws ClientExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws TransportExceptionInterface
+     */
+    private function sendLegacyMessage(ChatMessage $message, ?MessageOptionsInterface $options): SentMessage
+    {
+        $json = $options?->toArray() ?? [];
+        $json['codeSnippet'] ??= $message->getSubject();
 
         $path = $message->getRecipientId() ?? $this->path;
-        $endpoint = \sprintf('https://%s%s', $this->getEndpoint(), $path);
-        $response = $this->client->request('POST', $endpoint, [
-            'json' => $options,
-        ]);
+        $endpoint = sprintf('https://%s%s', $this->getEndpoint(), $path);
+        $response = $this->client->request('POST', $endpoint, ['json' => $json]);
 
         try {
             $statusCode = $response->getStatusCode();
@@ -72,22 +111,80 @@ final class MicrosoftTeamsTransport extends AbstractTransport
         }
 
         $requestId = $response->getHeaders(false)['request-id'][0] ?? null;
-        if (null === $requestId) {
+
+        if ($options instanceof MicrosoftTeamsOptions && null === $requestId) {
             $originalContent = $message->getSubject();
 
-            throw new TransportException(\sprintf('Unable to post the Microsoft Teams message: "%s" (request-id not found).', $originalContent), $response);
+            throw new TransportException(
+                sprintf('Unable to post the Microsoft Teams message: "%s" (request-id not found).', $originalContent),
+                $response,
+            );
         }
 
         if (200 !== $statusCode) {
             $errorMessage = $response->getContent(false);
             $originalContent = $message->getSubject();
 
-            throw new TransportException(\sprintf('Unable to post the Microsoft Teams message: "%s" (%s : "%s").', $originalContent, $requestId, $errorMessage), $response);
+            throw new TransportException(
+                sprintf(
+                    'Unable to post the Microsoft Teams message: "%s" (%s: "%s").',
+                    $originalContent,
+                    $requestId ?? 'none',
+                    $errorMessage,
+                ), $response,
+            );
         }
 
-        $message = new SentMessage($message, (string) $this);
-        $message->setMessageId($requestId);
+        $responseMessage = new SentMessage($message, (string)$this);
+        $responseMessage->setMessageId($requestId);
 
-        return $message;
+        return $responseMessage;
+    }
+
+    /**
+     * @throws TransportExceptionInterface
+     * @throws ServerExceptionInterface
+     * @throws RedirectionExceptionInterface
+     * @throws ClientExceptionInterface
+     * @throws JsonException
+     */
+    private function sendMessage(ChatMessage $message, ?MessageOptionsInterface $options): SentMessage
+    {
+        $json = $options?->toArray() ?? [];
+        $endpoint = str_replace(self::DSN_PREFIX, 'https', (string)$this);
+
+        try {
+            $response = $this->client->request('POST', $endpoint, ['json' => $json]);
+            $statusCode = $response->getStatusCode();
+        } catch (TransportExceptionInterface $e) {
+            throw new TransportException('Could not reach the remote MicrosoftTeams server.', $response ?? null, 0, $e);
+        }
+
+        if (202 !== $statusCode) {
+            $errorResponse = $response->getContent(false);
+            $originalContent = $message->getSubject();
+            $decoded = json_decode($errorResponse, true, 512, JSON_THROW_ON_ERROR);
+            $error = $decoded['error'] ?? null;
+
+            if ($error) {
+                $errorText = json_encode($error, JSON_THROW_ON_ERROR);
+            } else {
+                $errorText = $errorResponse;
+            }
+
+            throw new TransportException(
+                sprintf(
+                    'Failed to post Microsoft Teams message: "%s". Response code: %s. Error: %s',
+                    $originalContent,
+                    $statusCode,
+                    $errorText,
+                ), $response,
+            );
+        }
+
+        $responseMessage = new SentMessage($message, (string)$this);
+        $responseMessage->setMessageId((string)$statusCode);
+
+        return $responseMessage;
     }
 }

@@ -33,13 +33,15 @@ final class MicrosoftTeamsTransportFactory extends AbstractTransportFactory
         $path = $dsn->getPath();
 
         if (null === $path) {
-            throw new IncompleteDsnException('Path is not set.', 'microsoftteams://'.$dsn->getHost());
+            throw new IncompleteDsnException('Path is not set.', 'microsoftteams://' . $dsn->getHost());
         }
 
         $host = $dsn->getHost();
         $port = $dsn->getPort();
 
-        return (new MicrosoftTeamsTransport($path, $this->client, $this->dispatcher))->setHost($host)->setPort($port);
+        return (new MicrosoftTeamsTransport($path, $dsn->getOptions(), $this->client, $this->dispatcher))
+            ->setHost($host)
+            ->setPort($port);
     }
 
     protected function getSupportedSchemes(): array

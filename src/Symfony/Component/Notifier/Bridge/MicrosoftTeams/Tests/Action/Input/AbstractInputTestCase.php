@@ -9,7 +9,7 @@
  * file that was distributed with this source code.
  */
 
-namespace Symfony\Component\Notifier\Bridge\MicrosoftTeams\Test\Action\Input;
+namespace Symfony\Component\Notifier\Bridge\MicrosoftTeams\Tests\Action\Input;
 
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Notifier\Bridge\MicrosoftTeams\Action\Input\AbstractInput;
